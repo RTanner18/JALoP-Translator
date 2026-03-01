@@ -4,10 +4,12 @@
  *
  * Build:
  *   gcc -shared -fPIC -o omjalop.so omjalop.c \
- *       -I/path/to/rsyslog/runtime \
  *       -I/path/to/rsyslog \
- *       $(xml2-config --cflags --libs) \
- *       $(curl-config --cflags --libs) \
+ *       -I/path/to/rsyslog/runtime \
+ *       -I/path/to/rsyslog/grammar \
+ *       -I/usr/include/json-c \
+ *       -I/usr/include/libxml2 \
+ *       $(pkg-config --cflags --libs libxml-2.0 libcurl) \
  *       -luuid
  *
  * rsyslog.conf:
@@ -50,7 +52,7 @@
 #include "syslogd-types.h"
 #include "template.h"
 #include "module-template.h"
-#include "errmsg.h"
+/* errmsg.h removed: LogError() is now a direct function in modern rsyslog */
 #include "cfsysline.h"
 
 MODULE_TYPE_OUTPUT
@@ -143,14 +145,6 @@ static size_t curl_discard(void *ptr, size_t size, size_t nmemb,
 
 /* ------------------------------------------------------------------ */
 /* Build JALoP 2.0 application-metadata XML                           */
-/*                                                                     */
-/* Spec reference: JSR-INF-0006 §3.2 (JALoP 2.0 syslog metadata)     */
-/*                                                                     */
-/* Minimal schema:                                                     */
-/*   <JALRecord xmlns="http://www.jalop.net/jalop/2.0">               */
-/*     <ApplicationMetadata>                                           */
-/*       <JournalMetadata | SyslogMetadata | AuditMetadata>           */
-/*         ...                                                         */
 /* ------------------------------------------------------------------ */
 static char *build_app_metadata(const char *timestamp,
                                  const char *hostname,
@@ -166,8 +160,6 @@ static char *build_app_metadata(const char *timestamp,
     char *meta = NULL;
     int len;
 
-    /* For log records we emit SyslogMetadata.                        */
-    /* Adjust the inner element for JALOP_AUDIT / JALOP_JOURNAL.      */
     const char *inner_open  = (rectype == JALOP_LOG)
                                 ? "SyslogMetadata"
                                 : (rectype == JALOP_AUDIT)
@@ -209,20 +201,6 @@ static char *build_app_metadata(const char *timestamp,
 
 /* ------------------------------------------------------------------ */
 /* POST one JALoP 2.0 record                                          */
-/*                                                                     */
-/* JALoP 2.0 HTTP store endpoint:                                     */
-/*   POST <base_url>/log   (or /audit, /journal)                      */
-/*                                                                     */
-/* Required headers:                                                   */
-/*   JAL-Message: log-record                                           */
-/*   JAL-Id: <uuid>                                                    */
-/*   JAL-Application-Metadata-Length: <bytes>                         */
-/*   JAL-Payload-Length: <bytes>                                       */
-/*   Content-Type: multipart/mixed; boundary=<boundary>               */
-/*                                                                     */
-/* Multipart body:                                                     */
-/*   Part 1 — application metadata XML                                 */
-/*   Part 2 — payload (the original syslog XML line)                  */
 /* ------------------------------------------------------------------ */
 static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
                                    const char *app_meta,
@@ -240,22 +218,12 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
     char *body = NULL;
     int   body_len;
 
-    /* Build endpoint URL */
     const char *path = (pData->rectype == JALOP_LOG)     ? "/log"
                      : (pData->rectype == JALOP_AUDIT)   ? "/audit"
                                                           : "/journal";
     if (asprintf(&url, "%s%s", (char *)pData->jalop_url, path) < 0)
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 
-    /* Build multipart body:
-     *   --<boundary>\r\n
-     *   Content-Type: application/xml\r\n\r\n
-     *   <app_meta>\r\n
-     *   --<boundary>\r\n
-     *   Content-Type: application/xml\r\n\r\n
-     *   <payload>\r\n
-     *   --<boundary>--\r\n
-     */
     body_len = asprintf(&body,
         "--%s\r\n"
         "Content-Type: application/xml\r\n\r\n"
@@ -269,7 +237,6 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
         boundary);
     if (body_len < 0) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 
-    /* Build headers */
     hdrs = curl_slist_append(hdrs, "JAL-Message: log-record");
 
     snprintf(hdr_buf, sizeof(hdr_buf), "JAL-Id: %s", jalop_id);
@@ -287,7 +254,6 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
              "Content-Type: multipart/mixed; boundary=%s", boundary);
     hdrs = curl_slist_append(hdrs, hdr_buf);
 
-    /* Configure curl */
     curl_easy_setopt(curl, CURLOPT_URL,            url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     hdrs);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body);
@@ -295,7 +261,6 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  curl_discard);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,        10L);
 
-    /* TLS */
     if (pData->tls_cert)
         curl_easy_setopt(curl, CURLOPT_SSLCERT, (char *)pData->tls_cert);
     if (pData->tls_key)
@@ -307,15 +272,16 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
 
     CURLcode rc = curl_easy_perform(curl);
     if (rc != CURLE_OK) {
-        errmsg.LogError(0, RS_RET_ERR,
+        /* Modern rsyslog: LogError() is a direct call, no errmsg object */
+        LogError(0, RS_RET_ERR,
             "omjalop: curl POST failed: %s", curl_easy_strerror(rc));
-        ABORT_FINALIZE(RS_RET_SUSPENDED);   /* trigger rsyslog retry */
+        ABORT_FINALIZE(RS_RET_SUSPENDED);
     }
 
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (http_code != 200 && http_code != 204) {
-        errmsg.LogError(0, RS_RET_ERR,
+        LogError(0, RS_RET_ERR,
             "omjalop: JALoP store returned HTTP %ld", http_code);
         ABORT_FINALIZE(RS_RET_SUSPENDED);
     }
@@ -333,7 +299,7 @@ finalize_it:
 
 BEGINcreateInstance
 CODESTARTcreateInstance
-    pData->tls_verify = 1;   /* verify peer by default */
+    pData->tls_verify = 1;
 ENDcreateInstance
 
 BEGINcreateWrkrInstance
@@ -369,6 +335,13 @@ BEGINisCompatibleWithFeature
 CODESTARTisCompatibleWithFeature
 ENDisCompatibleWithFeature
 
+/* tryResume — called by rsyslog when an action is suspended           */
+BEGINtryResume
+CODESTARTtryResume
+    /* Always signal OK to retry; curl will fail again if still down  */
+    iRet = RS_RET_OK;
+ENDtryResume
+
 /* ------------------------------------------------------------------ */
 /* doAction — called for every matching log line                       */
 /* ------------------------------------------------------------------ */
@@ -377,12 +350,11 @@ BEGINdoAction
     const char   *xml_in = (const char *)ppString[0];
 CODESTARTdoAction
 
-    /* 1. Parse incoming XML from rsyslog template */
     xmlDocPtr  doc = xmlReadMemory(xml_in, (int)strlen(xml_in),
                                    "rsyslog.xml", NULL,
                                    XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
     if (!doc) {
-        errmsg.LogError(0, RS_RET_ERR,
+        LogError(0, RS_RET_ERR,
             "omjalop: failed to parse input XML: %s", xml_in);
         ABORT_FINALIZE(RS_RET_ERR);
     }
@@ -390,7 +362,6 @@ CODESTARTdoAction
     xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
     if (!ctx) { xmlFreeDoc(doc); ABORT_FINALIZE(RS_RET_ERR); }
 
-    /* 2. Extract fields — adjust XPath to your template's element names */
     char *timestamp = xpath_str(ctx, "/entry/timestamp",  "1970-01-01T00:00:00Z");
     char *hostname  = xpath_str(ctx, "/entry/hostname",   "unknown");
     char *appname   = xpath_str(ctx, "/entry/appname",    "-");
@@ -401,16 +372,13 @@ CODESTARTdoAction
 
     xmlXPathFreeContext(ctx);
 
-    /* 3. Generate JAL-Id */
     char *jalop_id = gen_uuid();
     if (!jalop_id) { xmlFreeDoc(doc); ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY); }
 
-    /* 4. Build JALoP 2.0 application-metadata XML */
     char *app_meta = build_app_metadata(timestamp, hostname, appname,
                                          procid, msgid, severity, facility,
                                          jalop_id, pData->rectype);
 
-    /* 5. POST to JALoP store (payload = original XML line) */
     iRet = post_jalop_record(pWrkrData, app_meta, xml_in, jalop_id);
 
     free(timestamp); free(hostname); free(appname);
@@ -430,8 +398,6 @@ BEGINnewActInst
 CODESTARTnewActInst
     if ((pvals = nvlstGetParams(lst, &actpblk, NULL)) == NULL)
         ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-
-    CODE_STD_STRING_REQUESTnewActInst(1)  /* 1 template string */
 
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
@@ -460,12 +426,10 @@ CODESTARTnewActInst
         }
     }
 
-    /* default template if user doesn't specify one */
-    if (iNumTpls == 0) {
-        CHKiRet(OMSRsetEntry(*ppOMSR, 0,
-            (uchar *)strdup("RSYSLOG_FileFormat"),
-            OMSR_NO_RQD_TPL_OPTS));
-    }
+    /* Register template — 1 template string required */
+    CHKiRet(OMSRsetEntry(*ppOMSR, 0,
+        (uchar *)strdup("RSYSLOG_FileFormat"),
+        OMSR_NO_RQD_TPL_OPTS));
 
 CODE_STD_FINALIZERnewActInst
     cnfparamvalsDestruct(pvals, &actpblk);
@@ -490,9 +454,8 @@ CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
 ENDqueryEtryPt
 
 BEGINmodInit()
-CODESTARTmodInit
+CODESTARTmodInit;
     *ipIFVersProvided = CURR_MOD_IF_VERSION;
     curl_global_init(CURL_GLOBAL_ALL);
     xmlInitParser();
-    CODEmodInit_QueryRegCFSLineHdlr
 ENDmodInit
