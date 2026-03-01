@@ -1,0 +1,21 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "//home/tanner/rsyslog/**",
+                "//home/tanner/rsyslog/runtime/**",
+                "//home/tanner/rsyslog/grammar/**",
+                "//home/tanner/rsyslog/tools/**",
+                "//home/tanner/rsyslog/plugins/**"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
