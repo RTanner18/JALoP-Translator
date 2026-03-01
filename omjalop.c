@@ -52,7 +52,6 @@
 #include "syslogd-types.h"
 #include "template.h"
 #include "module-template.h"
-/* errmsg.h removed: LogError() is now a direct function in modern rsyslog */
 #include "cfsysline.h"
 
 MODULE_TYPE_OUTPUT
@@ -79,6 +78,7 @@ typedef struct _instanceData {
     uchar           *tls_cert;      /* client cert path (optional)    */
     uchar           *tls_key;       /* client key  path (optional)    */
     uchar           *tls_ca;        /* CA bundle   path (optional)    */
+    uchar           *tplName;       /* template name                  */
     int              tls_verify;    /* verify peer cert? default 1    */
 } instanceData;
 
@@ -97,6 +97,7 @@ static struct cnfparamdescr actpdescr[] = {
     { "tls_key",     eCmdHdlrGetWord, 0 },
     { "tls_ca",      eCmdHdlrGetWord, 0 },
     { "tls_verify",  eCmdHdlrBinary,  0 },
+    { "template",    eCmdHdlrGetWord, 0 },
 };
 static struct cnfparamblk actpblk = {
     CNFPARAMBLK_VERSION,
@@ -108,7 +109,6 @@ static struct cnfparamblk actpblk = {
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Generate a fresh UUID string (caller must free) */
 static char *gen_uuid(void) {
     uuid_t uu;
     char  *buf = malloc(37);
@@ -118,7 +118,6 @@ static char *gen_uuid(void) {
     return buf;
 }
 
-/* XPath helper: get first node text, or fallback */
 static char *xpath_str(xmlXPathContextPtr ctx, const char *expr,
                         const char *fallback) {
     xmlXPathObjectPtr obj = xmlXPathEvalExpression(
@@ -136,7 +135,6 @@ static char *xpath_str(xmlXPathContextPtr ctx, const char *expr,
     return strdup(fallback);
 }
 
-/* libcurl write callback — discard response body */
 static size_t curl_discard(void *ptr, size_t size, size_t nmemb,
                             void *userdata) {
     (void)ptr; (void)userdata;
@@ -272,7 +270,6 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
 
     CURLcode rc = curl_easy_perform(curl);
     if (rc != CURLE_OK) {
-        /* Modern rsyslog: LogError() is a direct call, no errmsg object */
         LogError(0, RS_RET_ERR,
             "omjalop: curl POST failed: %s", curl_easy_strerror(rc));
         ABORT_FINALIZE(RS_RET_SUSPENDED);
@@ -317,6 +314,7 @@ CODESTARTfreeInstance
     free(pData->tls_cert);
     free(pData->tls_key);
     free(pData->tls_ca);
+    free(pData->tplName);
 ENDfreeInstance
 
 BEGINfreeWrkrInstance
@@ -395,10 +393,13 @@ ENDdoAction
 BEGINnewActInst
     struct cnfparamvals *pvals;
     int i;
-CODESTARTnewActInst
-    if ((pvals = nvlstGetParams(lst, &actpblk, NULL)) == NULL)
+    CODESTARTnewActInst;
+    if ((pvals = nvlstGetParams(lst, &actpblk, NULL)) == NULL) {
         ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-
+    }
+    CHKiRet(createInstance(&pData));
+    pData->tls_verify = 1;  /* set defaults */
+    CODE_STD_STRING_REQUESTnewActInst(1);
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
 
@@ -423,15 +424,15 @@ CODESTARTnewActInst
 
         } else if (!strcmp(actpblk.descr[i].name, "tls_verify")) {
             pData->tls_verify = (int)pvals[i].val.d.n;
+
+        } else if (!strcmp(actpblk.descr[i].name, "template")) {
+            pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
         }
     }
-
-    /* Register template — 1 template string required */
     CHKiRet(OMSRsetEntry(*ppOMSR, 0,
-        (uchar *)strdup("RSYSLOG_FileFormat"),
+        (uchar *)strdup((pData->tplName == NULL) ? "RSYSLOG_FileFormat" : (char *)pData->tplName),
         OMSR_NO_RQD_TPL_OPTS));
-
-CODE_STD_FINALIZERnewActInst
+    CODE_STD_FINALIZERnewActInst;
     cnfparamvalsDestruct(pvals, &actpblk);
 ENDnewActInst
 
