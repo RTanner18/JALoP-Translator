@@ -9,7 +9,8 @@ Usage:
 
 Records are saved to ./jalop_records/<type>/<jal-id>.xml
 """
-
+import hashlib
+import xml.etree.ElementTree as ET
 import http.server
 import os
 import sys
@@ -23,8 +24,6 @@ RECORD_DIR = "./jalop_records"
 
 
 def parse_multipart(content_type, body):
-    """Parse multipart/mixed body, return list of (headers, content) parts."""
-    # Extract boundary from Content-Type header
     boundary = None
     for part in content_type.split(";"):
         part = part.strip()
@@ -36,19 +35,32 @@ def parse_multipart(content_type, body):
 
     boundary = boundary.encode()
     parts = []
-    # Split on boundary markers
     raw_parts = body.split(b"--" + boundary)
-    for raw in raw_parts[1:]:  # skip preamble
-        if raw.strip() == b"--":  # final boundary
+    for raw in raw_parts[1:]:
+        if raw.strip() == b"--":
             break
-        # Each part: \r\n<headers>\r\n\r\n<body>
-        raw = raw.lstrip(b"\r\n")
+        if raw.startswith(b"\r\n"):
+            raw = raw[2:]
         if b"\r\n\r\n" in raw:
             hdr_raw, content = raw.split(b"\r\n\r\n", 1)
-            content = content.rstrip(b"\r\n")
+            #content = content.rstrip(b"\r\n")  # <-- strip trailing CRLF
             parts.append((hdr_raw.decode(errors="replace"), content))
     return parts
 
+def verify_payload_hash(metadata_xml_bytes, payload_bytes):
+    try:
+        root = ET.fromstring(metadata_xml_bytes)
+        ns = {"jal": root.tag.split("}")[0].strip("{")}
+        hash_elem = root.find(".//jal:IntegrityMetadata/jal:Hash", ns)
+        if hash_elem is None:
+            return (None, None, False)
+        expected_hash = hash_elem.text.strip()
+        # <-- HASH EXACT RAW BYTES
+        computed_hash = hashlib.sha256(payload_bytes).hexdigest()
+        return (expected_hash, computed_hash, expected_hash == computed_hash)
+    except Exception as e:
+        print(f"  Hash verification error: {e}")
+        return (None, None, False)
 
 class JALoPHandler(http.server.BaseHTTPRequestHandler):
 
@@ -96,17 +108,33 @@ class JALoPHandler(http.server.BaseHTTPRequestHandler):
 
         safe_id = jal_id.replace("/", "_").replace("\\", "_")
 
+        metadata_bytes = None
+        payload_bytes = None
+
         if len(parts) >= 1:
+            metadata_bytes = parts[0][1]
             meta_path = os.path.join(out_dir, f"{safe_id}_metadata.xml")
             with open(meta_path, "wb") as f:
                 f.write(parts[0][1])
             print(f"  Saved metadata: {meta_path}")
 
         if len(parts) >= 2:
+            payload_bytes = parts[1][1]
             payload_path = os.path.join(out_dir, f"{safe_id}_payload.xml")
             with open(payload_path, "wb") as f:
                 f.write(parts[1][1])
             print(f"  Saved payload:  {payload_path}")
+
+        if len(parts) >=2:
+            expected, computed, ok = verify_payload_hash(
+                metadata_bytes,
+                payload_bytes
+            )
+        if not ok:
+            self.send_response(400)
+            self.end_headers()
+            print("  ERROR: payload hash mismatch")
+            return
 
         # Also save a combined JSON summary
         summary = {

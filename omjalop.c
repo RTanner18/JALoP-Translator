@@ -1,40 +1,3 @@
-/* omjalop.c - rsyslog output module: custom XML → JALoP 2.0 (HTTP)
- *
- * Dependencies: libxml2, libcurl, libuuid
- *
- * Build:
- *   gcc -shared -fPIC -o omjalop.so omjalop.c \
- *       -I/path/to/rsyslog \
- *       -I/path/to/rsyslog/runtime \
- *       -I/path/to/rsyslog/grammar \
- *       -I/usr/include/json-c \
- *       -I/usr/include/libxml2 \
- *       $(pkg-config --cflags --libs libxml-2.0 libcurl) \
- *       -luuid
- *
- * rsyslog.conf:
- *   module(load="/usr/lib/rsyslog/omjalop.so")
- *
- *   template(name="MyXML" type="string" string="<entry>
- *     <timestamp>%TIMESTAMP:::date-rfc3339%</timestamp>
- *     <hostname>%HOSTNAME%</hostname>
- *     <appname>%APP-NAME%</appname>
- *     <procid>%PROCID%</procid>
- *     <msgid>%MSGID%</msgid>
- *     <severity>%syslogseverity-text%</severity>
- *     <facility>%syslogfacility-text%</facility>
- *     <message>%msg%</message>
- *   </entry>\n")
- *
- *   action(type="omjalop"
- *          jalop_url="http://localhost:9000"
- *          jalop_type="log"
- *          tls_cert="/etc/ssl/jalop/client.crt"
- *          tls_key="/etc/ssl/jalop/client.key"
- *          tls_ca="/etc/ssl/jalop/ca.crt"
- *          template="MyXML")
- */
-
 #include "config.h"
 #include "rsyslog.h"
 #include <stdio.h>
@@ -47,6 +10,7 @@
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
 #include <curl/curl.h>
+#include <openssl/sha.h>
 
 #include "conf.h"
 #include "syslogd-types.h"
@@ -141,6 +105,27 @@ static size_t curl_discard(void *ptr, size_t size, size_t nmemb,
     return size * nmemb;
 }
 
+static char *sha256_hex(const char *data, size_t len)
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX ctx;
+    char *out = malloc(SHA256_DIGEST_LENGTH * 2 + 1);
+    int i;
+
+    if (!out)
+        return NULL;
+
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, data, len);
+    SHA256_Final(hash, &ctx);
+
+    for (i = 0; i < SHA256_DIGEST_LENGTH; ++i)
+        sprintf(out + (i * 2), "%02x", hash[i]);
+
+    out[SHA256_DIGEST_LENGTH * 2] = '\0';
+    return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* Build JALoP 2.0 application-metadata XML                           */
 /* ------------------------------------------------------------------ */
@@ -152,6 +137,7 @@ static char *build_app_metadata(const char *timestamp,
                                  const char *severity,
                                  const char *facility,
                                  const char *jalop_id,
+                                 const char *payload_hash,
                                  jalop_rectype_t rectype)
 {
     const char *ns = "http://www.jalop.net/jalop/2.0";
@@ -165,33 +151,38 @@ static char *build_app_metadata(const char *timestamp,
                                     : "JournalMetadata";
     const char *inner_close = inner_open;
 
-    len = asprintf(&meta,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        "<JALRecord xmlns=\"%s\">\n"
-        "  <ApplicationMetadata>\n"
-        "    <%s>\n"
-        "      <JalEntryId>%s</JalEntryId>\n"
-        "      <Timestamp>%s</Timestamp>\n"
-        "      <Hostname>%s</Hostname>\n"
-        "      <ApplicationName>%s</ApplicationName>\n"
-        "      <ProcessID>%s</ProcessID>\n"
-        "      <MessageID>%s</MessageID>\n"
-        "      <Severity>%s</Severity>\n"
-        "      <Facility>%s</Facility>\n"
-        "    </%s>\n"
-        "  </ApplicationMetadata>\n"
-        "</JALRecord>\n",
-        ns,
-        inner_open,
-        jalop_id,
-        timestamp,
-        hostname,
-        appname,
-        procid,
-        msgid,
-        severity,
-        facility,
-        inner_close);
+len = asprintf(&meta,
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<JALRecord xmlns=\"%s\">\n"
+    "  <ApplicationMetadata>\n"
+    "    <%s>\n"
+    "      <JalEntryId>%s</JalEntryId>\n"
+    "      <Timestamp>%s</Timestamp>\n"
+    "      <Hostname>%s</Hostname>\n"
+    "      <ApplicationName>%s</ApplicationName>\n"
+    "      <ProcessID>%s</ProcessID>\n"
+    "      <MessageID>%s</MessageID>\n"
+    "      <Severity>%s</Severity>\n"
+    "      <Facility>%s</Facility>\n"
+    "    </%s>\n"
+    "  </ApplicationMetadata>\n"
+    "\n"
+    "  <IntegrityMetadata>\n"
+    "    <Hash algorithm=\"SHA-256\">%s</Hash>\n"
+    "  </IntegrityMetadata>\n"
+    "</JALRecord>\n",
+    ns,
+    inner_open,
+    jalop_id,
+    timestamp,
+    hostname,
+    appname,
+    procid,
+    msgid,
+    severity,
+    facility,
+    inner_close,
+    payload_hash);
 
     if (len < 0) return NULL;
     return meta;
@@ -370,18 +361,65 @@ CODESTARTdoAction
 
     xmlXPathFreeContext(ctx);
 
-    char *jalop_id = gen_uuid();
-    if (!jalop_id) { xmlFreeDoc(doc); ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY); }
+    char *payload_to_send = xml_in;
+    size_t plen = strlen(payload_to_send);
 
-    char *app_meta = build_app_metadata(timestamp, hostname, appname,
-                                         procid, msgid, severity, facility,
-                                         jalop_id, pData->rectype);
+    char *tmp = malloc(plen + 2);
+    if (tmp == NULL) {
+        xmlFreeDoc(doc);
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
+
+    memcpy(tmp, payload_to_send, plen);
+    tmp[plen] = '\r';
+    tmp[plen + 1] = '\n';
+
+    char *payload_hash = sha256_hex(tmp, plen + 2);
+    free(tmp);
+
+    if (!payload_hash) {
+        xmlFreeDoc(doc);
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
+
+    char *jalop_id = gen_uuid();
+    if (!jalop_id) {
+        xmlFreeDoc(doc);
+        free(payload_hash);
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
+
+    char *app_meta = build_app_metadata(
+                        timestamp,
+                        hostname,
+                        appname,
+                        procid,
+                        msgid,
+                        severity,
+                        facility,
+                        jalop_id,
+                        payload_hash,
+                        pData->rectype);
+
+    if (!app_meta) {
+        xmlFreeDoc(doc);
+        free(payload_hash);
+        free(jalop_id);
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
 
     iRet = post_jalop_record(pWrkrData, app_meta, xml_in, jalop_id);
 
-    free(timestamp); free(hostname); free(appname);
-    free(procid);    free(msgid);    free(severity);
-    free(facility);  free(jalop_id); free(app_meta);
+    free(timestamp);
+    free(hostname);
+    free(appname);
+    free(procid);
+    free(msgid);
+    free(severity);
+    free(facility);
+    free(jalop_id);
+    free(app_meta);
+    free(payload_hash);
     xmlFreeDoc(doc);
 
 finalize_it:
