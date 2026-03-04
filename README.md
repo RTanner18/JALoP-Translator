@@ -66,7 +66,7 @@ JALoP Reader is a simple HTTP reciever that stores the files locally. It splits 
 
 ## Remaining Stuff to Implement
 
-* openssl Key Signature
+* openssl cert Signature
 * Linear chaining for storage
 
 

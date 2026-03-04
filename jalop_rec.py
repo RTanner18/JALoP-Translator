@@ -14,10 +14,7 @@ import xml.etree.ElementTree as ET
 import http.server
 import os
 import sys
-import email
-import json
 from datetime import datetime
-from io import BytesIO
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
 RECORD_DIR = "./jalop_records"
@@ -43,7 +40,6 @@ def parse_multipart(content_type, body):
             raw = raw[2:]
         if b"\r\n\r\n" in raw:
             hdr_raw, content = raw.split(b"\r\n\r\n", 1)
-            #content = content.rstrip(b"\r\n")  # <-- strip trailing CRLF
             parts.append((hdr_raw.decode(errors="replace"), content))
     return parts
 
@@ -55,7 +51,6 @@ def verify_payload_hash(metadata_xml_bytes, payload_bytes):
         if hash_elem is None:
             return (None, None, False)
         expected_hash = hash_elem.text.strip()
-        # <-- HASH EXACT RAW BYTES
         computed_hash = hashlib.sha256(payload_bytes).hexdigest()
         return (expected_hash, computed_hash, expected_hash == computed_hash)
     except Exception as e:
@@ -125,29 +120,16 @@ class JALoPHandler(http.server.BaseHTTPRequestHandler):
                 f.write(parts[1][1])
             print(f"  Saved payload:  {payload_path}")
 
-        if len(parts) >=2:
+        if len(parts) >= 2:
             expected, computed, ok = verify_payload_hash(
                 metadata_bytes,
                 payload_bytes
             )
-        if not ok:
-            self.send_response(400)
-            self.end_headers()
-            print("  ERROR: payload hash mismatch")
-            return
-
-        # Also save a combined JSON summary
-        summary = {
-            "jal_id":      jal_id,
-            "jal_message": jal_message,
-            "rec_type":    rec_type,
-            "timestamp":   datetime.now().isoformat(),
-            "meta_len":    meta_len,
-            "payload_len": payload_len,
-        }
-        summary_path = os.path.join(out_dir, f"{safe_id}_summary.json")
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
+            if not ok:
+                self.send_response(400)
+                self.end_headers()
+                print("  ERROR: payload hash mismatch")
+                return
 
         # Respond 200 OK
         self.send_response(200)
