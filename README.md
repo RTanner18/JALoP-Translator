@@ -63,3 +63,10 @@ Verify the daemon is active and running.\
 ## JALoP Reader Config
 
 JALoP Reader is a simple HTTP reciever that stores the files locally. It splits the payload into the metadata and payload files per JALoP2.0.
+
+## Remaining Stuff to Implement
+
+* openssl Key Signature
+* Linear chaining for storage
+
+

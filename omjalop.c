@@ -288,6 +288,7 @@ finalize_it:
 BEGINcreateInstance
 CODESTARTcreateInstance
     pData->tls_verify = 1;
+    pData->rectype = JALOP_LOG;
 ENDcreateInstance
 
 BEGINcreateWrkrInstance
@@ -337,6 +338,10 @@ ENDtryResume
 BEGINdoAction
     instanceData *pData = pWrkrData->pData;
     const char   *xml_in = (const char *)ppString[0];
+    if(xml_in == NULL){
+        LogError(0, RS_RET_ERR, "omjalop: template did not produce output");
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
 CODESTARTdoAction
 
     xmlDocPtr  doc = xmlReadMemory(xml_in, (int)strlen(xml_in),
