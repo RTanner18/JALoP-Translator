@@ -1,4 +1,11 @@
-# JALoP Translator Output Module Setup
+# JALoP Translator Output Module
+omjalop is a custom rsyslog output module that sends log records to a JALoP 2.0 compliant HTTP log store.
+
+It converts rsyslog messages into JALoP records, generates the required ApplicationMetadata, computes SHA-256 payload hashes, optionally signs records using XML Digital Signatures (XMLDSig), and delivers them to a remote HTTP endpoint using multipart/mixed POST requests.
+
+A companion Python utility (jalop_receiver.py) is included to act as a test JALoP HTTP store.
+
+# Setup Walkthrough
 
 ## Compile the JALoP Module
 Retrieve and generate all required header files to compile the Output Module.\
@@ -77,16 +84,16 @@ systemctl status syslog
 Verify the daemon is active and running.\
 <small>*Note: the logs will show a curl POST failed. That is normal behavior as the JALoP reader is not configured yet.*</small>
 
+## JALoP Receiver Config
 
+JALoP receiver acts as the HTTP endpoint to receive and verify JALoP log integrity. The script can receive logs locally or over the network per requirements. 
 
-## JALoP Reader Config
-
-JALoP Reader is a simple HTTP reciever that stores the files locally. It splits the payload into the metadata and payload files per JALoP2.0.
 
 ## Remaining Stuff to Implement
 
-* openssl cert Signature
-* Linear chaining for storage
-* storage into one file
+* Metadata and Payload Reader
+* TLS config
+* Using the default OS syslog rather than having to clone, recompile, and override the module.
+
 
 

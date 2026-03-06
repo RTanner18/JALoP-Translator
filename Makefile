@@ -25,5 +25,6 @@ $(TARGET): $(SRC)
 
 clean:
 	rm -f $(TARGET)
+	rm -rf jalop_records
 
 .PHONY: all clean

@@ -9,12 +9,14 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
+#include <libxml/c14n.h>
 #include <curl/curl.h>
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
+#include <openssl/x509.h>
 
 #include "conf.h"
 #include "syslogd-types.h"
@@ -48,8 +50,8 @@ typedef struct _instanceData {
     uchar           *tls_ca;        /* CA bundle   path (optional)    */
     uchar           *tplName;       /* template name                  */
     int              tls_verify;    /* verify peer cert? default 1    */
-    uchar *signing_key;   /* private key PEM */
-    uchar *signing_cert;  /* optional certificate */
+    uchar           *signing_key;   /* private key PEM path           */
+    uchar           *signing_cert;  /* certificate PEM path (optional)*/
 } instanceData;
 
 typedef struct wrkrInstanceData {
@@ -61,13 +63,13 @@ typedef struct wrkrInstanceData {
 /* Config parameter descriptors                                        */
 /* ------------------------------------------------------------------ */
 static struct cnfparamdescr actpdescr[] = {
-    { "jalop_url",   eCmdHdlrGetWord, CNFPARAM_REQUIRED },
-    { "jalop_type",  eCmdHdlrGetWord, 0 },   /* log|audit|journal, default log */
-    { "tls_cert",    eCmdHdlrGetWord, 0 },
-    { "tls_key",     eCmdHdlrGetWord, 0 },
-    { "tls_ca",      eCmdHdlrGetWord, 0 },
-    { "tls_verify",  eCmdHdlrBinary,  0 },
-    { "template",    eCmdHdlrGetWord, 0 },
+    { "jalop_url",    eCmdHdlrGetWord, CNFPARAM_REQUIRED },
+    { "jalop_type",   eCmdHdlrGetWord, 0 },
+    { "tls_cert",     eCmdHdlrGetWord, 0 },
+    { "tls_key",      eCmdHdlrGetWord, 0 },
+    { "tls_ca",       eCmdHdlrGetWord, 0 },
+    { "tls_verify",   eCmdHdlrBinary,  0 },
+    { "template",     eCmdHdlrGetWord, 0 },
     { "signing_key",  eCmdHdlrGetWord, 0 },
     { "signing_cert", eCmdHdlrGetWord, 0 },
 };
@@ -113,23 +115,30 @@ static size_t curl_discard(void *ptr, size_t size, size_t nmemb,
     return size * nmemb;
 }
 
-static char *sha256_hex(const char *data, size_t len)
+/*
+ * sha256_hex — compute SHA-256 over (data, len) and return lowercase hex.
+ * Caller must free() the returned string.
+ */
+static char *sha256_hex(const unsigned char *data, size_t len)
 {
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX ctx;
-    char *out = malloc(SHA256_DIGEST_LENGTH * 2 + 1);
-    int i;
+    EVP_MD_CTX   *ctx = EVP_MD_CTX_new();
+    char         *out = malloc(SHA256_DIGEST_LENGTH * 2 + 1);
+    int           i;
 
-    if (!out)
+    if (!ctx || !out) {
+        EVP_MD_CTX_free(ctx);
+        free(out);
         return NULL;
+    }
 
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, data, len);
-    SHA256_Final(hash, &ctx);
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, data, len);
+    EVP_DigestFinal_ex(ctx, hash, NULL);
+    EVP_MD_CTX_free(ctx);
 
     for (i = 0; i < SHA256_DIGEST_LENGTH; ++i)
         sprintf(out + (i * 2), "%02x", hash[i]);
-
     out[SHA256_DIGEST_LENGTH * 2] = '\0';
     return out;
 }
@@ -139,10 +148,10 @@ static char *base64_encode(const unsigned char *input, int length)
     BIO *bmem = NULL, *b64 = NULL;
     BUF_MEM *bptr = NULL;
 
-    b64 = BIO_new(BIO_f_base64());
+    b64  = BIO_new(BIO_f_base64());
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
     bmem = BIO_new(BIO_s_mem());
-    b64 = BIO_push(b64, bmem);
+    b64  = BIO_push(b64, bmem);
 
     BIO_write(b64, input, length);
     BIO_flush(b64);
@@ -150,12 +159,16 @@ static char *base64_encode(const unsigned char *input, int length)
 
     char *buff = malloc(bptr->length + 1);
     memcpy(buff, bptr->data, bptr->length);
-    buff[bptr->length] = 0;
+    buff[bptr->length] = '\0';
 
     BIO_free_all(b64);
     return buff;
 }
 
+/*
+ * sign_data — RSA-SHA256 sign (data, data_len) using the PEM private key
+ * at key_path.  Returns base64-encoded DER signature; caller must free().
+ */
 static char *sign_data(const char *key_path,
                        const unsigned char *data,
                        size_t data_len)
@@ -166,33 +179,24 @@ static char *sign_data(const char *key_path,
     EVP_PKEY *pkey = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
     fclose(fp);
     if (!pkey) {
-        LogError(0, RS_RET_ERR, "Failed to load private key %s", key_path);
+        LogError(0, RS_RET_ERR, "omjalop: failed to load private key %s", key_path);
         return NULL;
     }
 
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     if (!ctx) { EVP_PKEY_free(pkey); return NULL; }
 
-    if (EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, pkey) <= 0)
-        goto err;
-
-    if (EVP_DigestSignUpdate(ctx, data, data_len) <= 0)
-        goto err;
+    if (EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, pkey) <= 0) goto err;
+    if (EVP_DigestSignUpdate(ctx, data, data_len) <= 0) goto err;
 
     size_t siglen = 0;
-    if (EVP_DigestSignFinal(ctx, NULL, &siglen) <= 0)
-        goto err;
+    if (EVP_DigestSignFinal(ctx, NULL, &siglen) <= 0) goto err;
 
     unsigned char *sig = malloc(siglen);
     if (!sig) goto err;
+    if (EVP_DigestSignFinal(ctx, sig, &siglen) <= 0) { free(sig); goto err; }
 
-    if (EVP_DigestSignFinal(ctx, sig, &siglen) <= 0) {
-        free(sig);
-        goto err;
-    }
-
-    char *b64 = base64_encode(sig, siglen);
-
+    char *b64 = base64_encode(sig, (int)siglen);
     free(sig);
     EVP_MD_CTX_free(ctx);
     EVP_PKEY_free(pkey);
@@ -204,125 +208,150 @@ err:
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* Build JALoP 2.0 application-metadata XML                           */
-/* ------------------------------------------------------------------ */
-static char *build_app_metadata_unsigned(const char *timestamp,
-                                 const char *hostname,
-                                 const char *appname,
-                                 const char *procid,
-                                 const char *msgid,
-                                 const char *severity,
-                                 const char *facility,
-                                 const char *jalop_id,
-                                 const char *payload_hash,
-                                 jalop_rectype_t rectype)
+/*
+ * read_cert_b64 — read a PEM certificate file and return the bare base64
+ * body (no headers/newlines) for embedding in XML.  Caller must free().
+ */
+static char *read_cert_b64(const char *cert_path)
 {
-    const char *ns = "http://www.jalop.net/jalop/2.0";
-    char *meta = NULL;
-    int len;
+    FILE *fp = fopen(cert_path, "r");
+    if (!fp) return NULL;
 
-    const char *inner_open  = (rectype == JALOP_LOG)
-                                ? "SyslogMetadata"
-                                : (rectype == JALOP_AUDIT)
-                                    ? "AuditMetadata"
-                                    : "JournalMetadata";
-    const char *inner_close = inner_open;
+    X509 *cert = PEM_read_X509(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (!cert) return NULL;
 
-len = asprintf(&meta,
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-    "<JALRecord xmlns=\"%s\">\n"
-    "  <ApplicationMetadata>\n"
-    "    <%s>\n"
-    "      <JalEntryId>%s</JalEntryId>\n"
-    "      <Timestamp>%s</Timestamp>\n"
-    "      <Hostname>%s</Hostname>\n"
-    "      <ApplicationName>%s</ApplicationName>\n"
-    "      <ProcessID>%s</ProcessID>\n"
-    "      <MessageID>%s</MessageID>\n"
-    "      <Severity>%s</Severity>\n"
-    "      <Facility>%s</Facility>\n"
-    "    </%s>\n"
-    "  </ApplicationMetadata>\n"
-    "\n"
-    "  <IntegrityMetadata>\n"
-    "    <Hash algorithm=\"SHA-256\">%s</Hash>\n"
-    "  </IntegrityMetadata>\n"
-    "</JALRecord>\n",
-    ns,
-    inner_open,
-    jalop_id,
-    timestamp,
-    hostname,
-    appname,
-    procid,
-    msgid,
-    severity,
-    facility,
-    inner_close,
-    payload_hash);
+    unsigned char *der = NULL;
+    int der_len = i2d_X509(cert, &der);
+    X509_free(cert);
+    if (der_len <= 0) return NULL;
 
-    if (len < 0) return NULL;
-    return meta;
+    char *b64 = base64_encode(der, der_len);
+    OPENSSL_free(der);
+    return b64;
+}
+/*
+ * build_xmldsig_signature_element
+ *
+ * Produces a minimal W3C XMLDSig <ds:Signature> block suitable for
+ * embedding in ApplicationMetadata.  The SignedInfo/Reference URI
+ * points to the payload via "#payload", and the DigestValue is the
+ * base64-encoded SHA-256 of the raw payload bytes.
+ *
+ * signature_b64  – base64 of the RSA-SHA256 signature over the
+ *                  canonicalised <ds:SignedInfo> element (enveloped).
+ * payload_digest – base64 of SHA-256(payload bytes).
+ * cert_b64       – optional base64 DER of the signing certificate;
+ *                  pass NULL to omit <ds:KeyInfo>.
+ *
+ * Caller must free() the returned string.
+ */
+static char *build_xmldsig_element(const char *signature_b64,
+                                   const char *payload_digest_b64,
+                                   const char *cert_b64)
+{
+    char *out = NULL;
+    char *keyinfo = NULL;
+
+    if (cert_b64) {
+        if (asprintf(&keyinfo,
+            "    <ds:KeyInfo>\n"
+            "      <ds:X509Data>\n"
+            "        <ds:X509Certificate>%s</ds:X509Certificate>\n"
+            "      </ds:X509Data>\n"
+            "    </ds:KeyInfo>\n",
+            cert_b64) < 0)
+            return NULL;
+    }
+
+    if (asprintf(&out,
+        "  <ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n"
+        "    <ds:SignedInfo>\n"
+        "      <ds:CanonicalizationMethod\n"
+        "          Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>\n"
+        "      <ds:SignatureMethod\n"
+        "          Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\n"
+        "      <ds:Reference URI=\"#payload\">\n"
+        "        <ds:DigestMethod\n"
+        "            Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\n"
+        "        <ds:DigestValue>%s</ds:DigestValue>\n"
+        "      </ds:Reference>\n"
+        "    </ds:SignedInfo>\n"
+        "    <ds:SignatureValue>%s</ds:SignatureValue>\n"
+        "%s"
+        "  </ds:Signature>\n",
+        payload_digest_b64,
+        signature_b64,
+        keyinfo ? keyinfo : "") < 0) {
+        free(keyinfo);
+        return NULL;
+    }
+
+    free(keyinfo);
+    return out;
 }
 
+/*
+ * build_app_metadata
+ *
+ * Builds the full ApplicationMetadata XML document.
+ * When xmldsig_elem is non-NULL it is embedded inside
+ * <ApplicationMetadata> per the JALoP 2.0 spec.
+ * <IntegrityMetadata> carries only the payload hash (raw hex).
+ */
 static char *build_app_metadata(const char *timestamp,
-                                 const char *hostname,
-                                 const char *appname,
-                                 const char *procid,
-                                 const char *msgid,
-                                 const char *severity,
-                                 const char *facility,
-                                 const char *jalop_id,
-                                 const char *payload_hash,
-                                 const char *signature_b64,
-                                 jalop_rectype_t rectype)
+                                const char *hostname,
+                                const char *appname,
+                                const char *procid,
+                                const char *msgid,
+                                const char *severity,
+                                const char *facility,
+                                const char *jalop_id,
+                                const char *payload_hash_hex,
+                                const char *xmldsig_elem,   /* may be NULL */
+                                jalop_rectype_t rectype)
 {
     const char *ns = "http://www.jalop.net/jalop/2.0";
     char *meta = NULL;
     int len;
 
-    const char *inner_open  = (rectype == JALOP_LOG)
-                                ? "SyslogMetadata"
-                                : (rectype == JALOP_AUDIT)
-                                    ? "AuditMetadata"
-                                    : "JournalMetadata";
-    const char *inner_close = inner_open;
+    const char *inner = (rectype == JALOP_LOG)     ? "SyslogMetadata"
+                      : (rectype == JALOP_AUDIT)   ? "AuditMetadata"
+                                                   : "JournalMetadata";
 
-len = asprintf(&meta,
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-    "<JALRecord xmlns=\"%s\">\n"
-    "  <ApplicationMetadata>\n"
-    "    <%s>\n"
-    "      <JalEntryId>%s</JalEntryId>\n"
-    "      <Timestamp>%s</Timestamp>\n"
-    "      <Hostname>%s</Hostname>\n"
-    "      <ApplicationName>%s</ApplicationName>\n"
-    "      <ProcessID>%s</ProcessID>\n"
-    "      <MessageID>%s</MessageID>\n"
-    "      <Severity>%s</Severity>\n"
-    "      <Facility>%s</Facility>\n"
-    "    </%s>\n"
-    "  </ApplicationMetadata>\n"
-    "\n"
-    "  <IntegrityMetadata>\n"
-    "    <Hash algorithm=\"SHA-256\">%s</Hash>\n"
-    "    <Signature algorithm=\"RSA-SHA256\">%s</Signature>\n"
-    "  </IntegrityMetadata>\n"
-    "</JALRecord>\n",
-    ns,
-    inner_open,
-    jalop_id,
-    timestamp,
-    hostname,
-    appname,
-    procid,
-    msgid,
-    severity,
-    facility,
-    inner_close,
-    payload_hash,
-    signature_b64 ? signature_b64 : "");
+    len = asprintf(&meta,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<JALRecord xmlns=\"%s\">\n"
+        "  <ApplicationMetadata>\n"
+        "    <%s>\n"
+        "      <JalEntryId>%s</JalEntryId>\n"
+        "      <Timestamp>%s</Timestamp>\n"
+        "      <Hostname>%s</Hostname>\n"
+        "      <ApplicationName>%s</ApplicationName>\n"
+        "      <ProcessID>%s</ProcessID>\n"
+        "      <MessageID>%s</MessageID>\n"
+        "      <Severity>%s</Severity>\n"
+        "      <Facility>%s</Facility>\n"
+        "    </%s>\n"
+        "%s"                        /* ds:Signature (may be empty) */
+        "  </ApplicationMetadata>\n"
+        "  <IntegrityMetadata>\n"
+        "    <Hash algorithm=\"SHA-256\">%s</Hash>\n"
+        "  </IntegrityMetadata>\n"
+        "</JALRecord>\n",
+        ns,
+        inner,
+        jalop_id,
+        timestamp,
+        hostname,
+        appname,
+        procid,
+        msgid,
+        severity,
+        facility,
+        inner,
+        xmldsig_elem ? xmldsig_elem : "",
+        payload_hash_hex);
 
     if (len < 0) return NULL;
     return meta;
@@ -334,6 +363,7 @@ len = asprintf(&meta,
 static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
                                    const char *app_meta,
                                    const char *payload,
+                                   size_t      payload_len,
                                    const char *jalop_id)
 {
     DEFiRet;
@@ -347,9 +377,19 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
     char *body = NULL;
     int   body_len;
 
-    const char *path = (pData->rectype == JALOP_LOG)     ? "/log"
-                     : (pData->rectype == JALOP_AUDIT)   ? "/audit"
-                                                          : "/journal";
+    const char *path;
+    const char *jal_message;
+    if (pData->rectype == JALOP_LOG) {
+        path = "/log";
+        jal_message = "log-record";
+    } else if (pData->rectype == JALOP_AUDIT) {
+        path = "/audit";
+        jal_message = "audit-record";
+    } else {
+        path = "/journal";
+        jal_message = "journal-record";
+    }
+
     if (asprintf(&url, "%s%s", (char *)pData->jalop_url, path) < 0)
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 
@@ -359,14 +399,17 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
         "%s\r\n"
         "--%s\r\n"
         "Content-Type: application/xml\r\n\r\n"
-        "%s\r\n"
+        "%.*s\r\n"
         "--%s--\r\n",
         boundary, app_meta,
-        boundary, payload,
+        boundary, (int)payload_len, payload,
         boundary);
     if (body_len < 0) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 
-    hdrs = curl_slist_append(hdrs, "JAL-Message: log-record");
+    hdrs = curl_slist_append(hdrs, "JAL-Version: 2.0");
+
+    snprintf(hdr_buf, sizeof(hdr_buf), "JAL-Message: %s", jal_message);
+    hdrs = curl_slist_append(hdrs, hdr_buf);
 
     snprintf(hdr_buf, sizeof(hdr_buf), "JAL-Id: %s", jalop_id);
     hdrs = curl_slist_append(hdrs, hdr_buf);
@@ -376,7 +419,7 @@ static rsRetVal post_jalop_record(wrkrInstanceData_t *pWrkrData,
     hdrs = curl_slist_append(hdrs, hdr_buf);
 
     snprintf(hdr_buf, sizeof(hdr_buf),
-             "JAL-Payload-Length: %zu", strlen(payload));
+             "JAL-Payload-Length: %zu", payload_len);
     hdrs = curl_slist_append(hdrs, hdr_buf);
 
     snprintf(hdr_buf, sizeof(hdr_buf),
@@ -467,10 +510,8 @@ BEGINisCompatibleWithFeature
 CODESTARTisCompatibleWithFeature
 ENDisCompatibleWithFeature
 
-/* tryResume — called by rsyslog when an action is suspended           */
 BEGINtryResume
 CODESTARTtryResume
-    /* Always signal OK to retry; curl will fail again if still down  */
     iRet = RS_RET_OK;
 ENDtryResume
 
@@ -480,7 +521,7 @@ ENDtryResume
 BEGINdoAction
     instanceData *pData = pWrkrData->pData;
     const char   *xml_in = (const char *)ppString[0];
-    if(xml_in == NULL){
+    if (xml_in == NULL) {
         LogError(0, RS_RET_ERR, "omjalop: template did not produce output");
         ABORT_FINALIZE(RS_RET_ERR);
     }
@@ -505,108 +546,79 @@ CODESTARTdoAction
     char *msgid     = xpath_str(ctx, "/entry/msgid",      "-");
     char *severity  = xpath_str(ctx, "/entry/severity",   "notice");
     char *facility  = xpath_str(ctx, "/entry/facility",   "user");
-
     xmlXPathFreeContext(ctx);
 
-    char *payload_to_send = xml_in;
-    size_t plen = strlen(payload_to_send);
-
-    char *tmp = malloc(plen + 2);
-    if (tmp == NULL) {
+    size_t payload_len = strlen(xml_in);
+    char *payload_hash_hex = sha256_hex((const unsigned char *)xml_in, payload_len);
+    if (!payload_hash_hex) {
         xmlFreeDoc(doc);
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     }
 
-    memcpy(tmp, payload_to_send, plen);
-    tmp[plen] = '\r';
-    tmp[plen + 1] = '\n';
-
-    char *payload_hash = sha256_hex(tmp, plen + 2);
-
-    if (!payload_hash) {
-        xmlFreeDoc(doc);
-        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    /* base64 of the raw SHA-256 bytes — used inside ds:DigestValue */
+    unsigned char raw_hash[SHA256_DIGEST_LENGTH];
+    {
+        EVP_MD_CTX *hctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(hctx, EVP_sha256(), NULL);
+        EVP_DigestUpdate(hctx, xml_in, payload_len);
+        EVP_DigestFinal_ex(hctx, raw_hash, NULL);
+        EVP_MD_CTX_free(hctx);
     }
+    char *payload_digest_b64 = base64_encode(raw_hash, SHA256_DIGEST_LENGTH);
 
     char *jalop_id = gen_uuid();
-    if (!jalop_id) {
+    if (!jalop_id || !payload_digest_b64) {
         xmlFreeDoc(doc);
-        free(payload_hash);
-        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-    }
-
-    char *app_meta_unsigned = build_app_metadata_unsigned(
-                        timestamp,
-                        hostname,
-                        appname,
-                        procid,
-                        msgid,
-                        severity,
-                        facility,
-                        jalop_id,
-                        payload_hash,
-                        pData->rectype);
-
-    if (!app_meta_unsigned) {
-        xmlFreeDoc(doc);
-        free(payload_hash);
+        free(payload_hash_hex);
+        free(payload_digest_b64);
         free(jalop_id);
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     }
 
-    size_t meta_len = strlen(app_meta_unsigned);
-
-    size_t to_sign_len = meta_len + plen + 2;
-
-    /*
-    unsigned char *to_sign = malloc(to_sign_len);
-    if (!to_sign)
-        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-
-    memcpy(to_sign, app_meta_unsigned, meta_len);
-    memcpy(to_sign + meta_len, tmp, plen + 2);
-    */
-
-    unsigned char *to_sign = (unsigned char *)payload_hash;
-    to_sign_len = strlen(payload_hash);
-
-    free(tmp);
-
+    char *xmldsig_elem  = NULL;
     char *signature_b64 = NULL;
+    char *cert_b64      = NULL;
+
     if (pData->signing_key) {
-        signature_b64 = sign_data((char *)pData->signing_key, to_sign, to_sign_len);
+        signature_b64 = sign_data((char *)pData->signing_key,
+                                  (const unsigned char *)xml_in,
+                                  payload_len);
         if (!signature_b64) {
-            LogError(0, RS_RET_ERR, "omjalop: signing failed - sending unsigned record");
+            LogError(0, RS_RET_ERR,
+                "omjalop: signing failed - sending unsigned record");
+        } else {
+            if (pData->signing_cert)
+                cert_b64 = read_cert_b64((char *)pData->signing_cert);
+
+            xmldsig_elem = build_xmldsig_element(signature_b64,
+                                                  payload_digest_b64,
+                                                  cert_b64);
         }
     }
 
     char *app_meta = build_app_metadata(
-        timestamp,
-        hostname,
-        appname,
-        procid,
-        msgid,
-        severity,
-        facility,
+        timestamp, hostname, appname, procid, msgid,
+        severity, facility,
         jalop_id,
-        payload_hash,
-        signature_b64 ? signature_b64 : "",
+        payload_hash_hex,
+        xmldsig_elem,
         pData->rectype);
 
-    iRet = post_jalop_record(pWrkrData, app_meta, xml_in, jalop_id);
+    if (!app_meta) {
+        xmlFreeDoc(doc);
+        free(payload_hash_hex); free(payload_digest_b64);
+        free(jalop_id); free(signature_b64);
+        free(cert_b64); free(xmldsig_elem);
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
 
-    free(timestamp);
-    free(hostname);
-    free(appname);
-    free(procid);
-    free(msgid);
-    free(severity);
-    free(facility);
-    free(jalop_id);
-    free(app_meta_unsigned);
-    free(signature_b64);
+    iRet = post_jalop_record(pWrkrData, app_meta, xml_in, payload_len, jalop_id);
+
+    free(timestamp);  free(hostname);  free(appname);
+    free(procid);     free(msgid);     free(severity);  free(facility);
+    free(jalop_id);   free(payload_hash_hex); free(payload_digest_b64);
+    free(signature_b64); free(cert_b64); free(xmldsig_elem);
     free(app_meta);
-    free(payload_hash);
     xmlFreeDoc(doc);
 
 finalize_it:
@@ -623,45 +635,39 @@ BEGINnewActInst
         ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
     }
     CHKiRet(createInstance(&pData));
-    pData->tls_verify = 1;  /* set defaults */
+    pData->tls_verify = 1;
     CODE_STD_STRING_REQUESTnewActInst(1);
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
 
         if (!strcmp(actpblk.descr[i].name, "jalop_url")) {
             pData->jalop_url = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-
         } else if (!strcmp(actpblk.descr[i].name, "jalop_type")) {
             char *t = es_str2cstr(pvals[i].val.d.estr, NULL);
             if      (!strcasecmp(t, "audit"))   pData->rectype = JALOP_AUDIT;
             else if (!strcasecmp(t, "journal")) pData->rectype = JALOP_JOURNAL;
             else                                pData->rectype = JALOP_LOG;
             free(t);
-
         } else if (!strcmp(actpblk.descr[i].name, "tls_cert")) {
             pData->tls_cert = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-
         } else if (!strcmp(actpblk.descr[i].name, "tls_key")) {
             pData->tls_key  = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-
         } else if (!strcmp(actpblk.descr[i].name, "tls_ca")) {
             pData->tls_ca   = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-
         } else if (!strcmp(actpblk.descr[i].name, "tls_verify")) {
             pData->tls_verify = (int)pvals[i].val.d.n;
-
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
             pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-        }
-        else if (!strcmp(actpblk.descr[i].name, "signing_key")) {
+        } else if (!strcmp(actpblk.descr[i].name, "signing_key")) {
             pData->signing_key = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-
         } else if (!strcmp(actpblk.descr[i].name, "signing_cert")) {
             pData->signing_cert = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
         }
     }
     CHKiRet(OMSRsetEntry(*ppOMSR, 0,
-        (uchar *)strdup((pData->tplName == NULL) ? "RSYSLOG_FileFormat" : (char *)pData->tplName),
+        (uchar *)strdup((pData->tplName == NULL)
+                        ? "RSYSLOG_FileFormat"
+                        : (char *)pData->tplName),
         OMSR_NO_RQD_TPL_OPTS));
     CODE_STD_FINALIZERnewActInst;
     cnfparamvalsDestruct(pvals, &actpblk);
