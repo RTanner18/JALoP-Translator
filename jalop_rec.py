@@ -16,9 +16,15 @@ import os
 import sys
 from datetime import datetime
 
+import base64
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
 RECORD_DIR = "./jalop_records"
-
+PUBLIC_KEY_PATH = "./public.pem"   # must match signing key
 
 def parse_multipart(content_type, body):
     boundary = None
@@ -56,6 +62,39 @@ def verify_payload_hash(metadata_xml_bytes, payload_bytes):
     except Exception as e:
         print(f"  Hash verification error: {e}")
         return (None, None, False)
+
+def verify_signature(metadata_xml_bytes, payload_bytes):
+    try:
+        root = ET.fromstring(metadata_xml_bytes)
+        ns = {"jal": root.tag.split("}")[0].strip("{")}
+
+        sig_elem = root.find(".//jal:IntegrityMetadata/jal:Signature", ns)
+        hash_elem = root.find(".//jal:IntegrityMetadata/jal:Hash", ns)
+
+        if sig_elem is None or not sig_elem.text:
+            print("No signature present")
+            return False
+
+        signature = base64.b64decode(sig_elem.text.strip())
+        payload_hash = hash_elem.text.strip()
+
+        data_to_verify = payload_hash.encode()
+
+        with open(PUBLIC_KEY_PATH, "rb") as f:
+            public_key = serialization.load_pem_public_key(f.read())
+
+        public_key.verify(
+            signature,
+            data_to_verify,
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+
+        return True
+
+    except Exception as e:
+        print(f"Signature verification failed: {e}")
+        return False
 
 class JALoPHandler(http.server.BaseHTTPRequestHandler):
 
@@ -130,6 +169,15 @@ class JALoPHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 print("  ERROR: payload hash mismatch")
                 return
+
+            # Signature check
+            if not verify_signature(metadata_bytes, payload_bytes):
+                self.send_response(400)
+                self.end_headers()
+                print("  ERROR: signature verification failed")
+                return
+
+            print("  Signature verification OK")
 
         # Respond 200 OK
         self.send_response(200)

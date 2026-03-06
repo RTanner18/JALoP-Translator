@@ -1,2 +1,4 @@
 *.so
 jalop_records
+.vscode
+public.pem

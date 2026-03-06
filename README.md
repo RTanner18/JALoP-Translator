@@ -42,11 +42,28 @@ action(
     type="omjalop"
     jalop_url="http://localhost:9000"
     jalop_type="log"
+    signing_key="/usr/local/lib/rsyslog/private.pem"
     template="syslog-xml"
 )
 ```
+### 2) Private/Public Key Generation
+This generates the key pair for the log signature to verify ownership integrity.
 
-### 2) Verify config and restart daemon
+Private key for omjalop:
+```
+sudo openssl genpkey -algorithm RSA -out /usr/local/lib/rsyslog/private.pem -pkeyopt rsa_keygen_bits:2048
+sudo chown syslog:syslog /usr/local/lib/rsyslog/private.pem
+sudo chmod 755 /usr/local/lib
+sudo chmod 755 /usr/local/lib/rsyslog
+sudo chmod 600 /usr/local/lib/rsyslog/private.pem
+```
+
+Public key for HTTP receiver:
+```
+sudo openssl rsa -in /usr/local/lib/rsyslog/private.pem -pubout -out public.pem
+```
+
+### 3) Verify config and restart daemon
 Verify: 
 ```
 sudo /usr/local/sbin/rsyslogd -N1
@@ -60,6 +77,8 @@ systemctl status syslog
 Verify the daemon is active and running.\
 <small>*Note: the logs will show a curl POST failed. That is normal behavior as the JALoP reader is not configured yet.*</small>
 
+
+
 ## JALoP Reader Config
 
 JALoP Reader is a simple HTTP reciever that stores the files locally. It splits the payload into the metadata and payload files per JALoP2.0.
@@ -68,5 +87,6 @@ JALoP Reader is a simple HTTP reciever that stores the files locally. It splits 
 
 * openssl cert Signature
 * Linear chaining for storage
+* storage into one file
 
 
