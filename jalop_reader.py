@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-jalop_reader.py
-
-Reads a JALoP metadata XML file and its matching payload XML file,
-prints the important fields, and verifies:
-1) IntegrityMetadata SHA-256 hash
-2) XMLDSig DigestValue (if present)
-3) RSA signature using public.pem (if present and available)
-
-Usage examples:
-    python3 jalop_reader.py ./jalop_records/log/<id>_metadata.xml ./jalop_records/log/<id>_payload.xml
-    python3 jalop_reader.py ./jalop_records/log/<id>_metadata.xml
-    python3 jalop_reader.py ./jalop_records/log/<id>
-"""
 
 import argparse
 import base64
