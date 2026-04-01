@@ -30,10 +30,8 @@ sudo cp omjalop.so /usr/local/lib/rsyslog/
 sudo systemctl restart syslog
 ```
 ## rsyslogd Setup
-### 1) Append the following to /etc/rsyslog.conf
+### 1) Append the following to `/etc/rsyslog.conf`
 ```
-module(load="/usr/local/lib/rsyslog/omjalop.so")
-
 template(name="syslog-xml" type="string" string="<entry>\
 <timestamp>%TIMESTAMP:::date-rfc3339%</timestamp>\
 <hostname>%HOSTNAME%</hostname>\
@@ -44,6 +42,30 @@ template(name="syslog-xml" type="string" string="<entry>\
 <facility>%syslogfacility-text%</facility>\
 <message>%msg%</message>\
 </entry>\n")
+
+template(name="auditd-xml" type="string" string="<entry>\
+<timestamp>%TIMESTAMP:::date-rfc3339%</timestamp>\
+<hostname>%HOSTNAME%</hostname>\
+<appname>auditd</appname>\
+<procid>%$!audit_pid%</procid>\
+<msgid>%$!audit_msgid%</msgid>\
+<severity>info</severity>\
+<facility>audit</facility>\
+<message>%msg%</message>\
+</entry>\n")
+
+if ($msg contains "audit(") then {
+    set $!audit_pid = re_extract($msg,"pid=([0-9]+)",0, 1, "-");
+    set $!audit_msgid = re_extract($msg, "audit\\([0-9\\.]+:([0-9]+)\\)", 0, 1, "0");
+    action(
+        type="omjalop"
+        jalop_url="http://localhost:9000"
+        jalop_type="audit"
+        signing_key="/usr/local/lib/rsyslog/private.pem"
+        template="auditd-xml"
+    )
+    stop
+}
 
 action(
     type="omjalop"
@@ -83,6 +105,13 @@ systemctl status syslog
 
 Verify the daemon is active and running.\
 <small>*Note: the logs will show a curl POST failed. That is normal behavior as the JALoP reader is not configured yet.*</small>
+
+## auditd Setup
+
+Open config file at `/etc/audit/plugins.d/syslog.conf` and toggle the `active` parameter to `active = yes`
+
+Restart auditd with `sudo systemctl restart auditd`
+* This routes copies auditd traffic to the syslog daemon to be converted to XML
 
 ## JALoP Receiver Config
 
