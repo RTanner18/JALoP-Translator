@@ -32,6 +32,8 @@ sudo systemctl restart syslog
 ## rsyslogd Setup
 ### 1) Append the following to `/etc/rsyslog.conf`
 ```
+$IncludeConfig /etc/rsyslog.d/*.conf
+
 template(name="syslog-xml" type="string" string="<entry>\
 <timestamp>%TIMESTAMP:::date-rfc3339%</timestamp>\
 <hostname>%HOSTNAME%</hostname>\
@@ -54,7 +56,7 @@ template(name="auditd-xml" type="string" string="<entry>\
 <message>%msg%</message>\
 </entry>\n")
 
-if ($msg contains "audit(") then {
+if ($syslogfacility-text == "authpriv") then {
     set $!audit_pid = re_extract($msg,"pid=([0-9]+)",0, 1, "-");
     set $!audit_msgid = re_extract($msg, "audit\\([0-9\\.]+:([0-9]+)\\)", 0, 1, "0");
     action(
@@ -117,6 +119,9 @@ Restart auditd with `sudo systemctl restart auditd`
 
 JALoP receiver acts as the HTTP endpoint to receive and verify JALoP log integrity. The script can receive logs locally or over the network per requirements. 
 
+```
+python3 jalop_rec.py {port_number}
+```
 
 ## Remaining Stuff to Implement
 

@@ -255,31 +255,31 @@ static char *build_xmldsig_element(const char *signature_b64,
 
     if (cert_b64) {
         if (asprintf(&keyinfo,
-            "    <ds:KeyInfo>\n"
-            "      <ds:X509Data>\n"
-            "        <ds:X509Certificate>%s</ds:X509Certificate>\n"
-            "      </ds:X509Data>\n"
-            "    </ds:KeyInfo>\n",
+            "      <ds:KeyInfo>\n"
+            "        <ds:X509Data>\n"
+            "          <ds:X509Certificate>%s</ds:X509Certificate>\n"
+            "        </ds:X509Data>\n"
+            "      </ds:KeyInfo>\n",
             cert_b64) < 0)
             return NULL;
     }
 
     if (asprintf(&out,
-        "  <ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n"
-        "    <ds:SignedInfo>\n"
-        "      <ds:CanonicalizationMethod\n"
-        "          Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>\n"
-        "      <ds:SignatureMethod\n"
-        "          Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\n"
-        "      <ds:Reference URI=\"#payload\">\n"
-        "        <ds:DigestMethod\n"
-        "            Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\n"
-        "        <ds:DigestValue>%s</ds:DigestValue>\n"
-        "      </ds:Reference>\n"
-        "    </ds:SignedInfo>\n"
-        "    <ds:SignatureValue>%s</ds:SignatureValue>\n"
+        "    <ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n"
+        "      <ds:SignedInfo>\n"
+        "        <ds:CanonicalizationMethod\n"
+        "            Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>\n"
+        "        <ds:SignatureMethod\n"
+        "            Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\n"
+        "        <ds:Reference URI=\"#payload\">\n"
+        "          <ds:DigestMethod\n"
+        "              Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\n"
+        "          <ds:DigestValue>%s</ds:DigestValue>\n"
+        "        </ds:Reference>\n"
+        "      </ds:SignedInfo>\n"
+        "      <ds:SignatureValue>%s</ds:SignatureValue>\n"
         "%s"
-        "  </ds:Signature>\n",
+        "    </ds:Signature>\n",
         payload_digest_b64,
         signature_b64,
         keyinfo ? keyinfo : "") < 0) {
